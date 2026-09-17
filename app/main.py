@@ -5,7 +5,9 @@
   任一超限则整体不扣减（原子性）；
 - BEGIN IMMEDIATE 使写事务串行化，并发请求不会突破限额；
 - request_id 首次出现时固化载荷与判定，重复提交原样返回，
-  载荷变化返回 409。
+  载荷变化返回 409；
+- 首次判定（放行/拒绝）与首次成功释放在各自原事务内追加一条
+  可校验哈希审计链记录（见 app/audit.py），幂等重放不重复记录。
 """
 from __future__ import annotations
 
@@ -17,10 +19,10 @@ import sqlite3
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from . import config
+from . import audit, config
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
 from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest
@@ -95,6 +97,19 @@ def consume(req: ConsumeRequest):
                         1 if decision["allowed"] else 0,
                         now,
                     ),
+                )
+                # 首次判定（放行或拒绝）在同一事务内追加审计记录；
+                # 幂等重放走上面的已存在分支，不会重复记录
+                audit.append_event(
+                    conn,
+                    op=audit.OP_CONSUME,
+                    business_id=req.request_id,
+                    result=(
+                        audit.RESULT_ALLOWED
+                        if decision["allowed"]
+                        else audit.RESULT_DENIED
+                    ),
+                    occurred_at=now,
                 )
                 conn.execute("COMMIT")
         except Exception:
@@ -245,6 +260,15 @@ def release(req: ReleaseRequest):
                         now,
                     ),
                 )
+                # 仅首次成功释放在同一事务内追加审计记录；
+                # 失败（404/409）整体回滚、重放走已存在分支，均不记录
+                audit.append_event(
+                    conn,
+                    op=audit.OP_RELEASE,
+                    business_id=req.release_id,
+                    result=audit.RESULT_RELEASED,
+                    occurred_at=now,
+                )
                 conn.execute("COMMIT")
                 replayed = False
         except Exception:
@@ -314,6 +338,42 @@ def _release_consumption(
         "events_reverted": deleted,
         "released_at": now,
     }
+
+
+# ---------------------------------------------------------------- 哈希审计链
+
+@app.get("/v1/audit")
+def get_audit(
+    after_seq: int = Query(0, ge=0, description="仅返回 seq 大于该值的记录"),
+    limit: int = Query(100, ge=1, le=1000, description="单次返回的最大记录数"),
+):
+    """按 seq 升序返回审计记录及当前链头。"""
+    conn = connect()
+    try:
+        records, head_seq, head_hash = audit.list_events(conn, after_seq, limit)
+    finally:
+        conn.close()
+    return {
+        "records": records,
+        "head": {"seq": head_seq, "hash": head_hash},
+        "next_after_seq": records[-1]["seq"] if records else after_seq,
+    }
+
+
+@app.get("/v1/audit/verify")
+def verify_audit():
+    """全链重算并返回校验结果。
+
+    - valid：链是否完整无误；
+    - checked_count：校验的记录条数；
+    - head_hash：当前链头哈希（空链为 64 个 0）；
+    - first_invalid_seq：首个失配记录的 seq，无失配时为 null。
+    """
+    conn = connect()
+    try:
+        return audit.verify_chain(conn)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------- 桶管理

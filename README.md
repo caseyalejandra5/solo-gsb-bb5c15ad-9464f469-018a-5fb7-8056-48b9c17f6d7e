@@ -13,6 +13,8 @@
   的用量贡献；同一消费只能由一个 `release_id` 释放，重放原样返回
 - **并发安全**：SQLite `BEGIN IMMEDIATE` 串行化写事务，并发请求不会突破限额
 - **用量查询**：随时查询桶当前窗口用量
+- **哈希审计链**：首次判定（放行/拒绝）与首次成功释放均在各自原事务内追加
+  一条 SHA-256 哈希链记录，幂等重放不重复记录；提供按 `seq` 翻页查询与全链重算校验
 
 ## 快速启动
 
@@ -143,6 +145,70 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
  "oldest_event_expires_at": 1789657717.47}
 ```
 
+### 5. 哈希审计链
+
+每次**首次消费判定**（放行 `200` 或拒绝 `429`）与**首次成功释放**，都在
+各自的原写事务内（同提交、同回滚）向仅追加的 `audit_log` 追加一条记录；
+幂等重放直接返回固化结果，**不重复记录**；失败的释放（`404`/`409`）
+事务回滚，也不会留痕。
+
+链规则：
+
+- 记录使用全局递增 `seq`（从 1 开始）；
+- 首条记录的 `prev_hash` 为 64 个 `0`，其后每条引用上一条的 `hash`；
+- `hash = SHA-256(prev_hash 的原始 32 字节 + UTF-8 canonical JSON 事件)`；
+- 事件 canonical JSON 键排序、无多余空白，固定包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `op` | 操作类型：`consume`（消费判定）/ `release`（成功释放） |
+| `business_id` | 业务 ID：`consume` 取 `request_id`，`release` 取 `release_id` |
+| `result` | 结果：`allowed` / `denied` / `released` |
+| `occurred_at` | 发生时间（epoch 秒，与判定/释放时刻一致） |
+
+按 `seq` 翻页查询（游标为上次最后一条的 `seq`，响应同时给出当前链头）：
+
+```bash
+curl "http://localhost:8000/v1/audit?after_seq=0&limit=100"
+```
+
+```json
+{
+  "records": [
+    {"seq": 1,
+     "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+     "hash": "c979be39953f1ec4c07b26cbb9247815e7cb7584089d4ab5d33b401068203a4d",
+     "event": {"business_id": "req-001", "occurred_at": 1789657657.47,
+               "op": "consume", "result": "allowed"}},
+    {"seq": 2,
+     "prev_hash": "c979be39953f1ec4c07b26cbb9247815e7cb7584089d4ab5d33b401068203a4d",
+     "hash": "5e8de1e930da96b784b8bb76a8a1bd9d4c5d1e18ecae2977401cbc5b60fce505",
+     "event": {"business_id": "release-001", "occurred_at": 1789657690.12,
+               "op": "release", "result": "released"}}
+  ],
+  "head": {"seq": 2, "hash": "5e8de1e930da96b784b8bb76a8a1bd9d4c5d1e18ecae2977401cbc5b60fce505"},
+  "next_after_seq": 2
+}
+```
+
+- `after_seq`：仅返回 `seq` 大于该值的记录，默认 `0`，必须 `>= 0`；
+- `limit`：每页条数，默认 `100`，范围 `1..1000`；
+- 空链的链头为 `{"seq": 0, "hash": "0000…0000"}`（64 个 0）。
+
+全链重算校验（逐条核对 `seq` 连续性、`prev_hash` 链接与 SHA-256 重算值）：
+
+```bash
+curl http://localhost:8000/v1/audit/verify
+```
+
+```json
+{"valid": true, "checked_count": 2,
+ "head_hash": "5e8de1e930da96b784b8bb76a8a1bd9d4c5d1e18ecae2977401cbc5b60fce505",
+ "first_invalid_seq": null}
+```
+
+发现篡改/断链时 `valid` 为 `false`，`first_invalid_seq` 给出最早失配记录的 `seq`。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -152,6 +218,8 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 | `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量 |
 | `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`） |
 | `GET` | `/v1/buckets` | 列出全部桶配置 |
+| `GET` | `/v1/audit?after_seq=&limit=` | 按 `seq` 升序返回审计记录与链头 |
+| `GET` | `/v1/audit/verify` | 全链重算，返回 `valid`/`checked_count`/`head_hash`/`first_invalid_seq` |
 | `GET` | `/healthz` | 健康检查 |
 
 交互式文档：`http://localhost:8000/docs`
@@ -177,6 +245,13 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
   重放命中时直接返回，哈希不一致返回 409。`releases` 表以 `release_id` 为主键固化
   目标 `request_id` 与释放结果：同目标重放原样返回并带 `X-Idempotent-Replay: true`，
   改指其他目标返回 409。
+- **审计链**：`audit_log` 为仅追加表，`seq` 由 SQLite AUTOINCREMENT 全局递增。
+  首次判定在固化 `requests` 之后、首次成功释放在写入 `releases` 之后，于**同一
+  `BEGIN IMMEDIATE` 事务**内追加审计记录——业务回滚则审计不生效，二者不可能分离；
+  幂等重放走不写入审计的独立分支。追加时先读链尾 `hash` 作为 `prev_hash`，按
+  `SHA-256(bytes.fromhex(prev_hash) + canonical_json(event))` 计算当前 `hash`，
+  写事务串行化保证链头读取与追加之间无并发分叉。`GET /v1/audit/verify` 从 64 个 0
+  的创世前序哈希起逐条重算，同时核对 `seq` 连续性，报告首个失配位置。
 - **最早重试时间**：按窗口内事件过期时刻累计释放量，找到最早可容纳本次请求的过期点；
   多桶受限时取各桶的最大值。
 
@@ -190,4 +265,6 @@ python -m pytest tests/ -q
 覆盖：原子扣减、幂等重放（含拒绝判定重放）、409 冲突、滚动窗口过期恢复、
 50 并发不超限额、同 `request_id` 并发只扣减一次，以及释放接口的多桶原子恢复、
 幂等重放、改指冲突、重复释放冲突、404/409 分支、释放后 consume 重放不再次扣减、
-20 并发释放仅一个成功等共 27 个用例。
+20 并发释放仅一个成功；此外覆盖哈希审计链的哈希规则纯函数、首条锚定 64 个 0、
+放行/拒绝/成功释放仅记一次且重放不重复、失败释放与 409/404 不留痕、分页与链头、
+全链校验有效与篡改检出（事件内容/前序指针）等共 36 个用例。

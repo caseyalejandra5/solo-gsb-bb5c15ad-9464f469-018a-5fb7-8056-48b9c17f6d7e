@@ -443,3 +443,263 @@ def test_release_validation_errors():
     assert r.status_code == 422
     r = client.post("/v1/quota/releases", json={"release_id": "r1"})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------- 哈希审计链
+
+def _audit(after_seq: int = 0, limit: int = 1000):
+    return client.get(
+        "/v1/audit", params={"after_seq": after_seq, "limit": limit}
+    )
+
+
+def test_audit_hash_rule_pure():
+    """链哈希规则：64 个 0 起链；SHA-256(prev 原始32字节 + canonical JSON)。"""
+    import hashlib
+
+    from app import audit
+
+    assert audit.GENESIS_HASH == "0" * 64
+
+    event = {
+        "op": "consume",
+        "business_id": "rid-1",
+        "result": "allowed",
+        "occurred_at": 1789657657.47,
+    }
+    event_json = audit.canonical_event_json(event)
+    # 键排序且无多余空白
+    assert event_json == (
+        '{"business_id":"rid-1","occurred_at":1789657657.47,'
+        '"op":"consume","result":"allowed"}'
+    )
+    digest = audit.compute_hash(audit.GENESIS_HASH, event_json)
+    assert digest == hashlib.sha256(
+        bytes(32) + event_json.encode("utf-8")
+    ).hexdigest()
+
+    # 第二条引用第一条 hash
+    event2 = dict(event, business_id="rid-2", result="denied")
+    digest2 = audit.compute_hash(digest, audit.canonical_event_json(event2))
+    assert digest2 == hashlib.sha256(
+        bytes.fromhex(digest)
+        + audit.canonical_event_json(event2).encode("utf-8")
+    ).hexdigest()
+    assert digest2 != digest
+
+
+def test_audit_first_record_anchors_at_genesis():
+    """链首记录 seq=1、prev_hash 为 64 个 0。"""
+    r = _audit(0, 1)
+    assert r.status_code == 200
+    first = r.json()["records"][0]
+    assert first["seq"] == 1
+    assert first["prev_hash"] == "0" * 64
+    assert len(first["hash"]) == 64
+    assert set(first["hash"]) <= set("0123456789abcdef")
+
+
+def test_audit_consume_appended_once_allow_and_deny():
+    """首次放行与首次拒绝各记一条；幂等重放不重复记录。"""
+    before = client.get("/v1/audit/verify").json()["checked_count"]
+
+    # 放行 + 重放
+    k_allow = _bucket(10, 60)
+    rid_allow = _rid()
+    assert _consume(rid_allow, k_allow, 3).status_code == 200
+    assert _consume(rid_allow, k_allow, 3).status_code == 200
+
+    # 先用一笔放行打满桶，再触发拒绝 + 拒绝重放
+    k_deny = _bucket(1, 60)
+    assert _consume(_rid(), k_deny, 1).status_code == 200
+    rid_denied = _rid()
+    assert _consume(rid_denied, k_deny, 1).status_code == 429
+    assert _consume(rid_denied, k_deny, 1).status_code == 429
+
+    after = client.get("/v1/audit/verify").json()["checked_count"]
+    # 放行 2 笔 + 拒绝 1 笔 = 3 条；两次重放不记录
+    assert after - before == 3
+
+    records = _audit(before, 10).json()["records"]
+    by_biz = {rec["event"]["business_id"]: rec for rec in records}
+    allow_rec = by_biz[rid_allow]
+    assert allow_rec["event"]["op"] == "consume"
+    assert allow_rec["event"]["result"] == "allowed"
+    assert isinstance(allow_rec["event"]["occurred_at"], (int, float))
+    deny_rec = by_biz[rid_denied]
+    assert deny_rec["event"]["op"] == "consume"
+    assert deny_rec["event"]["result"] == "denied"
+
+    # 链关系：逐条引用上一条 hash
+    prev = records[0]["prev_hash"]
+    for rec in records:
+        assert rec["prev_hash"] == prev
+        prev = rec["hash"]
+
+
+def test_audit_release_appended_only_on_first_success():
+    """仅首次成功释放记一条；重放与失败释放（404/409）均不记录。"""
+    before = client.get("/v1/audit/verify").json()["checked_count"]
+
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 4).status_code == 200
+    rel = _rid()
+    assert _release(rel, rid).status_code == 200
+    assert _release(rel, rid).status_code == 200  # 成功重放，不重复记录
+
+    # 失败释放：原单不存在(404)、重复释放(409)、释放被拒消费(409)
+    assert _release(_rid(), f"missing-{_rid()}").status_code == 404
+    assert _release(_rid(), rid).status_code == 409
+    rid_denied = _rid()
+    k2 = _bucket(1, 60)
+    assert _consume(rid_denied, k2, 1).status_code == 200
+    rid_blocked = _rid()
+    assert _consume(rid_blocked, k2, 1).status_code == 429
+    assert _release(_rid(), rid_blocked).status_code == 409
+
+    after = client.get("/v1/audit/verify").json()["checked_count"]
+    # consume 放行 rid、consume 放行 rid_denied、consume 拒绝 rid_blocked、
+    # release rel —— 共 4 条
+    assert after - before == 4
+
+    rec = [
+        r for r in _audit(before, 10).json()["records"]
+        if r["event"]["business_id"] == rel
+    ]
+    assert len(rec) == 1
+    event = rec[0]["event"]
+    assert event["op"] == "release"
+    assert event["result"] == "released"
+    assert event["business_id"] == rel
+    assert isinstance(event["occurred_at"], (int, float))
+    assert set(event) == {"op", "business_id", "result", "occurred_at"}
+
+
+def test_audit_conflict_and_unknown_bucket_not_recorded():
+    """409 幂等冲突与 404 桶未配置不产生审计记录。"""
+    before = client.get("/v1/audit/verify").json()["checked_count"]
+
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 1).status_code == 200
+    assert _consume(rid, key, 2).status_code == 409       # 载荷冲突
+    assert client.post("/v1/quota/consume", json={
+        "request_id": _rid(), "buckets": [{"key": "nope-bucket", "amount": 1}],
+    }).status_code == 404
+
+    assert client.get("/v1/audit/verify").json()["checked_count"] - before == 1
+
+
+def test_audit_pagination_and_head():
+    """GET /v1/audit 按 after_seq/limit 升序分页，并返回链头。"""
+    head_before = _audit(0, 1).json()["head"]["seq"]
+    key = _bucket(100, 60)
+    rids = []
+    for _ in range(3):
+        rid = _rid()
+        rids.append(rid)
+        assert _consume(rid, key, 1).status_code == 200
+
+    page1 = _audit(head_before, 2).json()
+    assert [r["seq"] for r in page1["records"]] == [
+        head_before + 1, head_before + 2,
+    ]
+    assert page1["next_after_seq"] == head_before + 2
+    assert page1["head"]["seq"] == head_before + 3
+
+    page2 = _audit(head_before + 2, 2).json()
+    assert [r["event"]["business_id"] for r in page2["records"]] == [rids[2]]
+    assert page2["records"][0]["prev_hash"] == page1["records"][1]["hash"]
+
+    # 追上链头后再翻页为空，链头保持不变
+    empty = _audit(head_before + 3, 2).json()
+    assert empty["records"] == []
+    assert empty["next_after_seq"] == head_before + 3
+    assert empty["head"] == page1["head"]
+
+    verify = client.get("/v1/audit/verify").json()
+    assert verify["head_hash"] == page1["head"]["hash"]
+
+
+def test_audit_query_validation():
+    r = client.get("/v1/audit", params={"after_seq": -1})
+    assert r.status_code == 422
+    r = client.get("/v1/audit", params={"limit": 0})
+    assert r.status_code == 422
+    r = client.get("/v1/audit", params={"limit": 1001})
+    assert r.status_code == 422
+
+
+def test_audit_verify_valid_full_chain():
+    """所有业务测试产生的记录构成一条完整有效链。"""
+    body = client.get("/v1/audit/verify").json()
+    assert set(body) == {
+        "valid", "checked_count", "head_hash", "first_invalid_seq",
+    }
+    assert body["valid"] is True
+    assert body["first_invalid_seq"] is None
+    assert len(body["head_hash"]) == 64
+    assert body["checked_count"] >= 1
+
+    listing = _audit(0, 1000).json()
+    assert len(listing["records"]) == body["checked_count"]
+    assert listing["head"]["hash"] == body["head_hash"]
+
+
+def test_audit_verify_detects_tampering():
+    """篡改事件内容或前序指针：verify 报告首个失配 seq；恢复后重新有效。"""
+    from app.db import connect
+
+    listing = _audit(0, 1000).json()
+    records = listing["records"]
+    target = records[-1]
+    original = None
+
+    conn = connect()
+    try:
+        original = conn.execute(
+            "SELECT event_json, prev_hash FROM audit_log WHERE seq = ?",
+            (target["seq"],),
+        ).fetchone()
+
+        # 1) 篡改事件内容：存储 hash 与重算值不符
+        conn.execute(
+            "UPDATE audit_log SET event_json = ? WHERE seq = ?",
+            (
+                '{"business_id":"forged","occurred_at":0,'
+                '"op":"consume","result":"allowed"}',
+                target["seq"],
+            ),
+        )
+        body = client.get("/v1/audit/verify").json()
+        assert body["valid"] is False
+        assert body["first_invalid_seq"] == target["seq"]
+        assert body["checked_count"] == len(records)
+
+        # 恢复后再次有效
+        conn.execute(
+            "UPDATE audit_log SET event_json = ? WHERE seq = ?",
+            (original["event_json"], target["seq"]),
+        )
+        assert client.get("/v1/audit/verify").json()["valid"] is True
+
+        # 2) 篡改前序指针：prev_hash 与上一条不一致
+        conn.execute(
+            "UPDATE audit_log SET prev_hash = ? WHERE seq = ?",
+            ("f" * 64, target["seq"]),
+        )
+        body = client.get("/v1/audit/verify").json()
+        assert body["valid"] is False
+        assert body["first_invalid_seq"] == target["seq"]
+    finally:
+        # 务必恢复，保证全链对后续检查保持有效
+        if original is not None:
+            conn.execute(
+                "UPDATE audit_log SET event_json = ?, prev_hash = ? WHERE seq = ?",
+                (original["event_json"], original["prev_hash"], target["seq"]),
+            )
+        conn.close()
+
+    assert client.get("/v1/audit/verify").json()["valid"] is True
+

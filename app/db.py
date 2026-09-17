@@ -50,6 +50,19 @@ CREATE TABLE IF NOT EXISTS releases (
     result      TEXT    NOT NULL,
     created_at  REAL    NOT NULL
 );
+
+-- 哈希审计链：仅追加。seq 全局递增，首条 prev_hash 为 64 个 0，
+-- hash = SHA-256(prev_hash 的原始32字节 + canonical JSON 事件)
+CREATE TABLE IF NOT EXISTS audit_log (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    prev_hash    TEXT    NOT NULL,
+    hash         TEXT    NOT NULL,
+    op           TEXT    NOT NULL,
+    business_id  TEXT    NOT NULL,
+    result       TEXT    NOT NULL,
+    event_json   TEXT    NOT NULL,
+    occurred_at  REAL    NOT NULL
+);
 """
 
 # 旧库增量迁移：为已存在的 requests 表补充 release_id 列
