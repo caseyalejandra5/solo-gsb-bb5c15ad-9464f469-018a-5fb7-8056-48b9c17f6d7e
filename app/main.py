@@ -17,10 +17,10 @@ import sqlite3
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from . import config
+from . import audit, config
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
 from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest
@@ -83,6 +83,15 @@ def consume(req: ConsumeRequest):
                 conn.execute("COMMIT")
             else:
                 decision = _evaluate_and_consume(conn, req.request_id, items, now)
+                # 首次判定（放行或拒绝）：在同一事务内追加审计记录，
+                # 事务失败则判定与审计一并回滚
+                audit.append_event(
+                    conn,
+                    op=audit.OP_CONSUME,
+                    biz_id=req.request_id,
+                    result="allowed" if decision["allowed"] else "denied",
+                    event_ts=now,
+                )
                 conn.execute(
                     "INSERT INTO requests "
                     "(request_id, payload_hash, payload, decision, allowed, created_at) "
@@ -235,6 +244,15 @@ def release(req: ReleaseRequest):
                 replayed = True
             else:
                 result = _release_consumption(conn, req.release_id, req.request_id, now)
+                # 首次成功释放：在同一事务内追加审计记录（失败整体回滚，无释放则无记录）
+                audit.append_event(
+                    conn,
+                    op=audit.OP_RELEASE,
+                    biz_id=req.release_id,
+                    result="released",
+                    event_ts=now,
+                    request_id=req.request_id,
+                )
                 conn.execute(
                     "INSERT INTO releases (release_id, request_id, result, created_at) "
                     "VALUES (?, ?, ?, ?)",
@@ -392,6 +410,37 @@ def bucket_usage(key: str):
         "as_of": now,
         "oldest_event_expires_at": None if oldest is None else oldest + window,
     }
+
+
+# ---------------------------------------------------------------- 哈希审计链
+
+@app.get("/v1/audit")
+def list_audit(
+    after_seq: int = Query(default=0, ge=0, description="只返回 seq 严格大于该值的记录"),
+    limit: int = Query(default=100, ge=1, le=1000, description="本页最多返回条数"),
+):
+    """按 seq 升序返回审计记录（游标分页），并携带当前链头。
+
+    空链时 head = {"seq": 0, "hash": "<64 个 0>"}。
+    """
+    conn = connect()
+    try:
+        records = audit.list_records(conn, after_seq=after_seq, limit=limit)
+        head = audit.get_head(conn)
+    finally:
+        conn.close()
+    return {"records": records, "head": head, "next_after_seq": after_seq + len(records)}
+
+
+@app.get("/v1/audit/verify")
+def verify_audit():
+    """重算整条审计链，返回校验结果与链头哈希。"""
+    conn = connect()
+    try:
+        result = audit.verify_chain(conn)
+    finally:
+        conn.close()
+    return result
 
 
 @app.get("/healthz")

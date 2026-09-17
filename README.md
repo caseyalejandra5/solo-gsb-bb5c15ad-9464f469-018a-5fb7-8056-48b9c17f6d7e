@@ -13,6 +13,9 @@
   的用量贡献；同一消费只能由一个 `release_id` 释放，重放原样返回
 - **并发安全**：SQLite `BEGIN IMMEDIATE` 串行化写事务，并发请求不会突破限额
 - **用量查询**：随时查询桶当前窗口用量
+- **哈希审计链**：首次消费判定（放行或拒绝）与首次成功释放在各自原事务内追加
+  仅追加（append-only）的可校验记录；`seq` 全局递增，SHA-256 链式哈希防篡改，
+  幂等重放不重复记录
 
 ## 快速启动
 
@@ -143,6 +146,74 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
  "oldest_event_expires_at": 1789657717.47}
 ```
 
+### 5. 哈希审计链
+
+每次**首次消费判定**（无论放行还是拒绝）与每次**首次成功释放**，都会在其原写事务内
+追加一条审计记录：与业务变更同生共死（事务回滚则审计也回滚），幂等重放不重复记录。
+
+链规则：
+
+- `seq` 全局递增（从 1 开始），由写事务串行化按提交顺序分配；
+- 首条记录 `prev_hash` 为 64 个 `0`，后续每条引用上一条的 `hash`；
+- `hash = SHA-256(prev_hash 的原始 32 字节 + UTF-8 canonical JSON 事件)`；
+- 事件 JSON 使用键排序、无多余空白，包含操作类型、业务 ID、结果、发生时间：
+
+| 字段 | 说明 |
+| --- | --- |
+| `op` | 操作类型：`consume` / `release` |
+| `biz_id` | 业务 ID：consume 为 `request_id`，release 为 `release_id` |
+| `result` | 结果：consume 为 `allowed` / `denied`，release 为 `released` |
+| `ts` | 发生时间，epoch 秒（与接口判定/释放时间一致） |
+| `request_id` | 仅 release 事件附带：被释放消费的 `request_id` |
+
+#### 查询审计记录
+
+```bash
+curl "http://localhost:8000/v1/audit?after_seq=0&limit=100"
+```
+
+按 `seq` 升序游标分页：`after_seq` 只返回 seq 严格大于该值的记录（默认 0），
+`limit` 取 1–1000（默认 100）。响应同时携带当前链头 `head` 与下一页游标
+`next_after_seq`；空链时 `head = {"seq": 0, "hash": "<64 个 0>"}`：
+
+```json
+{"records": [
+   {"seq": 1, "op": "consume", "biz_id": "req-001", "result": "allowed",
+    "ts": 1789657657.47,
+    "prev_hash": "0000…0000",
+    "hash": "7f19…afb5",
+    "event": {"biz_id": "req-001", "op": "consume",
+              "result": "allowed", "ts": 1789657657.47}},
+   {"seq": 2, "op": "release", "biz_id": "release-001", "result": "released",
+    "ts": 1789657690.12,
+    "prev_hash": "7f19…afb5",
+    "hash": "5b64…f6de",
+    "event": {"biz_id": "release-001", "op": "release",
+              "request_id": "req-001", "result": "released",
+              "ts": 1789657690.12}}],
+ "head": {"seq": 2, "hash": "5b64…f6de"},
+ "next_after_seq": 2}
+```
+
+> `event` 即入哈希的 canonical JSON 原文（解析后的对象），可直接据此独立复算 `hash`。
+
+#### 校验审计链
+
+```bash
+curl http://localhost:8000/v1/audit/verify
+```
+
+服务按 seq 升序重算全链（连续性 + `prev_hash` 引用 + 每条 `hash`）：
+
+```json
+{"valid": true, "checked_count": 2,
+ "head_hash": "5b64ccb721cf0786e709e8abbdc1ac1e500e3dac67bb9a3cfe09e6b72af276de",
+ "first_invalid_seq": null}
+```
+
+发现篡改/断链时 `valid` 为 `false`，`first_invalid_seq` 给出首个失效位置；
+空链返回 `valid: true`、`checked_count: 0`、`head_hash` 为 64 个 0。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -152,6 +223,8 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 | `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量 |
 | `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`） |
 | `GET` | `/v1/buckets` | 列出全部桶配置 |
+| `GET` | `/v1/audit?after_seq=&limit=` | 按 seq 游标分页返回审计记录及链头 |
+| `GET` | `/v1/audit/verify` | 重算审计链，返回 `valid` / `checked_count` / `head_hash` / `first_invalid_seq` |
 | `GET` | `/healthz` | 健康检查 |
 
 交互式文档：`http://localhost:8000/docs`
@@ -167,16 +240,23 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 ## 实现说明
 
 - **原子性**：`consume` 在单个 `BEGIN IMMEDIATE` 事务内完成"读窗口用量 → 判定 →
-  写扣减事件 → 固化判定"，任一环节失败整体回滚。`release` 同理：在单个写事务内
+  写扣减事件 → 追加审计记录 → 固化判定"，任一环节失败整体回滚。`release` 同理：在单个写事务内
   完成"校验原请求 → 删除其全部 `usage_events` → 标记 `requests.release_id`
-  → 写入 `releases` 释放记录"，保证所有桶同时恢复。
-- **并发**：`BEGIN IMMEDIATE` 使写事务在数据库级串行化；WAL 模式保证读（用量查询）不阻塞。
-  多个不同 `release_id` 并发释放同一消费时，事务串行化 + 占用标记保证仅一个成功，
-  其余返回 `409`。
+  → 追加审计记录 → 写入 `releases` 释放记录"，保证所有桶同时恢复。
+  审计追加与业务变更同事务：回滚则不留审计，幂等重放走固化结果分支、不追加记录
+  （失败释放如 404/409 本就不产生审计）。
+- **并发**：`BEGIN IMMEDIATE` 使写事务在数据库级串行化；WAL 模式保证读（用量查询、
+  审计查询/校验）不阻塞。审计链在事务内先读链头再插入，串行化保证 `seq` 连续、
+  `prev_hash` 引用不竞争。多个不同 `release_id` 并发释放同一消费时，事务串行化 +
+  占用标记保证仅一个成功，其余返回 `409`。
 - **幂等**：`requests` 表以 `request_id` 为主键，固化载荷 SHA-256 与判定 JSON；
   重放命中时直接返回，哈希不一致返回 409。`releases` 表以 `release_id` 为主键固化
   目标 `request_id` 与释放结果：同目标重放原样返回并带 `X-Idempotent-Replay: true`，
   改指其他目标返回 409。
+- **审计链**：`audit_log` 表仅追加，`seq INTEGER PRIMARY KEY AUTOINCREMENT` 全局递增；
+  `hash = SHA-256(bytes.fromhex(prev_hash) + canonical_event_json.encode("utf-8"))`，
+  首条前驱为 64 个 0。`GET /v1/audit/verify` 重算 seq 连续性、`prev_hash` 引用与每条哈希，
+  任一不符即报告首个失效 seq。
 - **最早重试时间**：按窗口内事件过期时刻累计释放量，找到最早可容纳本次请求的过期点；
   多桶受限时取各桶的最大值。
 
@@ -190,4 +270,7 @@ python -m pytest tests/ -q
 覆盖：原子扣减、幂等重放（含拒绝判定重放）、409 冲突、滚动窗口过期恢复、
 50 并发不超限额、同 `request_id` 并发只扣减一次，以及释放接口的多桶原子恢复、
 幂等重放、改指冲突、重复释放冲突、404/409 分支、释放后 consume 重放不再次扣减、
-20 并发释放仅一个成功等共 27 个用例。
+20 并发释放仅一个成功，并覆盖哈希审计链的：首次判定（放行/拒绝）留痕而重放不留痕、
+seq/prev_hash/hash 可独立复算、首次成功释放留痕而重放/失败释放不留痕、
+`after_seq`/`limit` 分页与参数校验、篡改后 `verify` 报告 `first_invalid_seq`、
+20 并发下链完整可校验，共 34 个用例。

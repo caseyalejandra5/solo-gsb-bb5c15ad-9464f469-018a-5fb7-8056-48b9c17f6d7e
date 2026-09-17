@@ -1,6 +1,8 @@
-"""端到端测试：原子扣减、幂等、409、并发不超限、滚动窗口恢复。"""
+"""端到端测试：原子扣减、幂等、409、并发不超限、滚动窗口恢复、哈希审计链。"""
+import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -443,3 +445,201 @@ def test_release_validation_errors():
     assert r.status_code == 422
     r = client.post("/v1/quota/releases", json={"release_id": "r1"})
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------- 哈希审计链
+
+GENESIS = "0" * 64
+
+
+def _all_audit(after_seq: int = 0):
+    """分页拉全量审计记录（默认页大小 100，测试累计记录可能超过一页）。"""
+    records = []
+    while True:
+        page = client.get(f"/v1/audit?after_seq={after_seq}&limit=100").json()
+        batch = page["records"]
+        records.extend(batch)
+        after_seq = page["next_after_seq"]
+        if len(batch) < 100:
+            return records, page["head"]
+
+
+def _audit_for(records, op: str, biz_id: str):
+    return [r for r in records if r["op"] == op and r["biz_id"] == biz_id]
+
+
+def _recompute(records, up_to: int | None = None):
+    """按规则独立重算哈希链，返回 (prev_hash, hash) of the last checked record。"""
+    prev = GENESIS
+    h = GENESIS
+    for r in records[:up_to]:
+        canonical = json.dumps(r["event"], sort_keys=True, separators=(",", ":"))
+        h = hashlib.sha256(bytes.fromhex(prev) + canonical.encode("utf-8")).hexdigest()
+        assert r["prev_hash"] == prev, f"seq {r['seq']} 的 prev_hash 断链"
+        prev = h
+    return h
+
+
+def test_audit_records_first_decisions_but_not_replays():
+    """首次消费（放行与拒绝）各留一条审计；幂等重放不重复记录。"""
+    key_ok = _bucket(10, 60)
+    rid_allow = _rid()
+    assert _consume(rid_allow, key_ok, 2).status_code == 200
+    assert _consume(rid_allow, key_ok, 2).status_code == 200  # 重放
+    assert _consume(rid_allow, key_ok, 9).status_code == 409  # 载荷冲突，非首次判定
+
+    key_full = _bucket(1, 60)
+    assert _consume(_rid(), key_full, 1).status_code == 200
+    rid_deny = _rid()
+    assert _consume(rid_deny, key_full, 1).status_code == 429
+    assert _consume(rid_deny, key_full, 1).status_code == 429  # 拒绝重放
+
+    records, head = _all_audit()
+    allowed = _audit_for(records, "consume", rid_allow)
+    denied = _audit_for(records, "consume", rid_deny)
+    assert len(allowed) == 1 and allowed[0]["result"] == "allowed"
+    assert len(denied) == 1 and denied[0]["result"] == "denied"
+    # 事件含规定四要素
+    ev = allowed[0]["event"]
+    assert ev == {
+        "op": "consume", "biz_id": rid_allow, "result": "allowed",
+        "ts": allowed[0]["ts"],
+    }
+    # 链头指向最后一条记录
+    assert head == {"seq": records[-1]["seq"], "hash": records[-1]["hash"]}
+
+
+def test_audit_chain_hashes_and_seqs():
+    """seq 全局递增从 1 开始；首条 prev_hash 为 64 个 0；哈希可被独立重算复现。"""
+    _consume(_rid(), _bucket(5, 60), 1)
+    records, head = _all_audit()
+    seqs = [r["seq"] for r in records]
+    assert seqs == list(range(1, len(records) + 1))
+    assert records[0]["prev_hash"] == GENESIS
+    last_hash = _recompute(records)
+    verify = client.get("/v1/audit/verify").json()
+    assert verify["valid"] is True
+    assert verify["first_invalid_seq"] is None
+    assert verify["checked_count"] == len(records)
+    assert verify["head_hash"] == last_hash == head["hash"]
+
+
+def test_audit_release_records_and_payload():
+    """首次成功释放留一条 release 审计；重放与失败释放不留记录。"""
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 4).status_code == 200
+    rel = _rid()
+    assert _release(rel, rid).status_code == 200
+    assert _release(rel, rid).status_code == 200  # 重放
+    # 已释放消费的二次释放（不同 release_id）失败，不得留审计
+    assert _release(_rid(), rid).status_code == 409
+    # 不存在的消费释放失败，不得留审计
+    assert _release(_rid(), f"missing-{_rid()}").status_code == 404
+
+    records, _ = _all_audit()
+    rels = _audit_for(records, "release", rel)
+    assert len(rels) == 1
+    r = rels[0]
+    assert r["result"] == "released"
+    assert r["event"] == {
+        "op": "release", "biz_id": rel, "result": "released",
+        "request_id": rid, "ts": r["ts"],
+    }
+    # release 与对应 consume 在同一条全局链上前后衔接
+    assert r["prev_hash"] in {x["hash"] for x in records}
+
+
+def test_audit_pagination_after_seq_and_limit():
+    """after_seq 游标分页与 limit 约束生效。"""
+    rid = _rid()
+    assert _consume(rid, _bucket(5, 60), 1).status_code == 200
+    records, _ = _all_audit()
+    target = _audit_for(records, "consume", rid)[0]
+    s = target["seq"]
+
+    page = client.get(f"/v1/audit?after_seq={s - 1}&limit=1").json()
+    assert [r["seq"] for r in page["records"]] == [s]
+    assert page["next_after_seq"] == s
+
+    page = client.get(f"/v1/audit?after_seq={s}&limit=10").json()
+    assert all(r["seq"] > s for r in page["records"])
+
+    assert client.get("/v1/audit?after_seq=-1").status_code == 422
+    assert client.get("/v1/audit?limit=0").status_code == 422
+    assert client.get("/v1/audit?limit=1001").status_code == 422
+
+
+def test_audit_head_and_verify_response_shape():
+    """链头字段形态固定为 {seq, hash}，hash 恒为 64 位十六进制。"""
+    head = client.get("/v1/audit").json()["head"]
+    assert set(head.keys()) == {"seq", "hash"}
+    assert isinstance(head["seq"], int) and head["seq"] >= 1
+    assert len(head["hash"]) == 64
+    int(head["hash"], 16)
+
+
+def test_audit_verify_detects_tampering():
+    """篡改一条记录的哈希载荷后，verify 报告首个失效 seq。"""
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 1).status_code == 200
+    records, head = _all_audit()
+    target = _audit_for(records, "consume", rid)[0]
+    seq, original_json = target["seq"], target["event"]
+    head_after = head["hash"]
+    db_path = os.environ["QUOTA_DB_PATH"]
+
+    tampered = dict(original_json)
+    tampered["result"] = "denied"
+    bogus_json = json.dumps(tampered, sort_keys=True, separators=(",", ":"))
+    try:
+        wc = sqlite3.connect(db_path)
+        wc.execute("UPDATE audit_log SET event_json = ? WHERE seq = ?", (bogus_json, seq))
+        wc.commit()
+        wc.close()
+
+        verify = client.get("/v1/audit/verify").json()
+        assert verify["valid"] is False
+        assert verify["first_invalid_seq"] == seq
+        # GET 返回的事件反映被篡改内容
+        fetched = client.get(f"/v1/audit?after_seq={seq - 1}&limit=1").json()["records"][0]
+        assert fetched["seq"] == seq
+        assert fetched["event"]["result"] == "denied"
+    finally:
+        wc = sqlite3.connect(db_path)
+        wc.execute(
+            "UPDATE audit_log SET event_json = ? WHERE seq = ?",
+            (json.dumps(original_json, sort_keys=True, separators=(",", ":")), seq),
+        )
+        wc.commit()
+        wc.close()
+
+    verify = client.get("/v1/audit/verify").json()
+    assert verify["valid"] is True
+    assert verify["head_hash"] == head_after
+
+
+def test_audit_concurrent_consumes_one_record_each():
+    """并发下审计链依然完整：每个首次判定恰好一条，链可整体校验通过。"""
+    key = _bucket(20, 60)
+    rids = [_rid() for _ in range(20)]
+    barrier = threading.Barrier(20)
+
+    def hit(r):
+        barrier.wait()
+        _consume(r, key, 1)
+
+    threads = [threading.Thread(target=hit, args=(r,)) for r in rids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    records, head = _all_audit()
+    # 每个 request_id 恰好一条审计（桶限额 20，全部放行）
+    for r in rids:
+        assert len(_audit_for(records, "consume", r)) == 1
+    verify = client.get("/v1/audit/verify").json()
+    assert verify["valid"] is True
+    assert verify["head_hash"] == head["hash"]
